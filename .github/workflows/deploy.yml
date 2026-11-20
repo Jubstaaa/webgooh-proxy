@@ -1,0 +1,66 @@
+name: deploy
+
+on:
+    push:
+        branches: [main]
+    workflow_dispatch:
+        inputs:
+            ref:
+                description: Commit on main to deploy. Pass an older commit to roll back.
+                required: true
+                type: string
+
+permissions:
+    contents: read
+
+concurrency:
+    group: proxy-deploy
+    cancel-in-progress: false
+
+jobs:
+    deploy:
+        name: deploy
+        runs-on: ubuntu-24.04
+        environment: Production
+        timeout-minutes: 15
+        steps:
+            - name: Check out the release commit
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  ref: ${{ inputs.ref || github.sha }}
+                  fetch-depth: 0
+                  persist-credentials: false
+
+            - name: Resolve the commit and require it to be on main
+              env:
+                  DEPLOY_REF: ${{ inputs.ref || github.sha }}
+              run: |
+                  sha=$(git rev-parse --verify "${DEPLOY_REF}^{commit}")
+                  if ! git merge-base --is-ancestor "$sha" origin/main; then
+                      echo "::error::$sha is not on main"
+                      exit 1
+                  fi
+                  echo "DEPLOY_SHA=$sha" >>"$GITHUB_ENV"
+
+            - name: Re-run the gate on the exact commit
+              run: scripts/check.sh
+
+            - name: Package the release files
+              run: |
+                  git archive --format=tar --output="$RUNNER_TEMP/release.tar" "$DEPLOY_SHA" \
+                      Caddyfile docker-compose.yml smoke/baseline.txt sites/beszel-shell sites/cronicle-identity
+
+            - name: Pin the droplet host key
+              uses: Jubstaaa/deploy-actions/ssh@1d9b582d7547aa6f02352b655c0721dd5a88071f # v1.3.0
+              with:
+                  host: ${{ secrets.PROXY_DEPLOY_HOST }}
+                  user: root
+                  key: ${{ secrets.PROXY_DEPLOY_SSH_KEY }}
+                  known-hosts: ${{ secrets.PROXY_DEPLOY_KNOWN_HOSTS }}
+                  alias: droplet
+
+            - name: Deploy through the forced command
+              run: |
+                  # The commit is a 40-hex SHA from git rev-parse, so expanding it on the runner is safe.
+                  # shellcheck disable=SC2029
+                  ssh droplet "deploy-proxy $DEPLOY_SHA" <"$RUNNER_TEMP/release.tar"

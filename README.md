@@ -1,0 +1,155 @@
+# webgooh-proxy
+
+The edge config for a small shared server: one Caddy container in front of
+several sites and apps, managed as code. Changes go through a pull request, a
+validation gate, and an automatic deploy with rollback. Nobody edits the live
+config on the server.
+
+It is a real setup, not a demo: it routes 19 public hostnames on one host, most of
+them behind Cloudflare, and it is what keeps them up.
+
+## What it does
+
+```mermaid
+flowchart LR
+    V[Visitor] --> CF[Cloudflare<br/>cache, WAF, Access]
+    CF -->|origin cert, cfonly| C
+    V2[Let's Encrypt site] -->|public TLS| C
+    subgraph Droplet
+        C[proxy-caddy<br/>this repo] -->|loopback| A1[app containers]
+        C -->|/srv| S[static sites]
+    end
+    G[git push / PR] --> CI[CI gate<br/>caddy validate, policy, gitleaks]
+    CI --> D[deploy on main<br/>forced command]
+    D -->|validated release + smoke| C
+```
+
+- **Origin lock.** Sites behind Cloudflare only answer requests that come from
+  Cloudflare's published ranges. Anything else is aborted, so Access and the WAF
+  cannot be bypassed by hitting the server directly. Every origin-certificate site
+  imports the same `cfonly` snippet; the policy check fails if one does not.
+- **Per-site headers.** Shared snippets set HSTS, `nosniff`, framing and referrer
+  policy on static sites, strip server fingerprints, and cache hashed assets for a
+  year while forcing HTML to revalidate.
+- **Loopback only.** Apps listen on `127.0.0.1`. The policy check fails on any
+  `reverse_proxy` upstream that is not loopback.
+- **Validated GitOps deploy.** A pull request must pass `caddy fmt`,
+  `caddy validate` in the exact image the host runs, the edge policy on the
+  adapted JSON, a secret scan of the full history, and the host-script tests.
+  Merges to `main` deploy through a forced command on the host.
+- **Automatic rollback.** The host validates the new release inside the running
+  container, switches atomically, reloads, then checks every hostname against
+  `smoke/baseline.txt`. Any difference restores the previous release, compose and
+  helpers, and fails the run. Drift (a release edited on the host) blocks a deploy
+  before anything changes.
+- **Least privilege.** The deploy key can run one script, `restrict`-ed in
+  `authorized_keys`. The workflow runs only on pushes to `main` and manual dispatch
+  from the owner, in an environment restricted to `main`. Pull requests and forks
+  never receive secrets.
+
+## Repository layout
+
+| Path | Purpose |
+| --- | --- |
+| `Caddyfile` | Edge config for every hostname. |
+| `docker-compose.yml` | The proxy container: pinned `caddy:2` digest, host network, read-only mounts. |
+| `sites/` | Static helper pages Caddy templates from `/srv`. |
+| `smoke/baseline.txt` | Expected HTTPS status per hostname, checked on the host after every deploy. |
+| `scripts/check.sh` | The gate (format, validate, policy). Same script in CI and before each deploy. |
+| `scripts/policy.sh` | Edge policy on `caddy adapt` JSON. |
+| `scripts/deploy-proxy.sh` | Host-side forced command: install, switch, reload, smoke, roll back. |
+| `scripts/test/` | Tests for the host script, run in CI with fake `docker` and `curl`. |
+
+Not in this repo: TLS private keys (on the host only), and the release output of
+each static site, which that site's own pipeline deploys.
+
+## Host layout
+
+```
+/opt/proxy/
+  docker-compose.yml      copy of the repo file (deploy-managed)
+  proxy.env               host-only settings, root 0600, never in git (see below)
+  deploy.log              one line per deploy, rollback and refusal
+  config/                 mounted read-only as /etc/caddy
+    current -> releases/<sha>   the live release (symlink swapped by deploys)
+    releases/<sha>/       Caddyfile, docker-compose.yml, smoke/, sites/, MANIFEST.sha256
+    certs/                origin certificate pairs (host-only)
+  sites/                  mounted read-only as /srv (static roots)
+```
+
+The container runs `caddy run --config /etc/caddy/current/Caddyfile`. The mount is
+the directory, so the symlink is resolved inside the container and a swap is
+picked up on reload. Mounting `current` itself would pin the release that was
+current at container start.
+
+### Host-only settings (`proxy.env`)
+
+`BESZEL_ALLOWED_EMAILS` is the pipe-separated list of named accounts that the
+metrics panel recognises. It is kept out of git on purpose. The file is
+`/opt/proxy/proxy.env`, mode `0600`, owned by root, and is passed to the container
+with `env_file`. Caddy substitutes it at load time with `{$BESZEL_ALLOWED_EMAILS}`.
+CI uses a dummy value, so validation never sees the real list. Changing the list
+means editing that file and running a deploy (or `docker compose up -d caddy`).
+
+## Add a site
+
+1. Put the TLS material for the domain under `config/certs` on the host, or use
+   `tls internal` / Let's Encrypt if the domain is not behind Cloudflare.
+2. Add the site block to `Caddyfile`. If it is behind Cloudflare, `import cfonly`.
+   Use `reverse_proxy 127.0.0.1:<port>` for apps, or `root * /srv/<name>` for static
+   sites (ship the files into `/opt/proxy/sites/<name>` through that site's own pipeline).
+3. Add the hostname and its expected status to `smoke/baseline.txt`. Get the status
+   on the host: `curl -sk -o /dev/null -w '%{http_code}' --resolve host:443:127.0.0.1 https://host/`.
+4. `scripts/check.sh` locally. Open a PR. The job summary lists added and removed
+   hostnames. Merge, and the deploy runs.
+
+The policy check fails if a hostname appears without a baseline entry, or if a
+Cloudflare-proxied site lacks the origin lock.
+
+## Roll back
+
+Automatic: a failed reload or smoke test rolls back on the host and the run fails.
+
+Manual, to any commit already on `main`:
+
+```
+gh workflow run deploy.yml --repo Jubstaaa/webgooh-proxy --ref main -f ref=<commit-sha>
+gh run watch --repo Jubstaaa/webgooh-proxy
+```
+
+The workflow refuses commits that are not on `main`. The release directories
+kept on the host are the last 10, plus the current and previous one, so any recent
+commit redeploys with no rebuild.
+
+## Emergency (GitHub or the deploy path is down)
+
+Only if `deploy-proxy` cannot run. As root on the host:
+
+```
+cd /opt/proxy
+ls config/releases                                  # choose a known-good release
+ln -s releases/<good-sha> config/.current.next && mv -T config/.current.next config/current
+docker exec proxy-caddy caddy reload --config /etc/caddy/current/Caddyfile --adapter caddyfile
+echo "$(date -u +%FT%TZ) MANUAL current -> <good-sha>" >> deploy.log
+```
+
+Then fix `main` through a PR and redeploy it. Never edit a file under
+`config/releases/` in place: the next deploy refuses it as drift.
+
+## Secrets and settings
+
+| Name | Where | What |
+| --- | --- | --- |
+| `PROXY_DEPLOY_HOST` | repo secret | Address of the host, used only by `deploy.yml`. |
+| `PROXY_DEPLOY_KNOWN_HOSTS` | repo secret | Pinned host key for that address. |
+| `PROXY_DEPLOY_SSH_KEY` | repo secret | Private key for the forced command. Only the public half exists on the host. |
+| `BESZEL_ALLOWED_EMAILS` | host file `/opt/proxy/proxy.env` | Named accounts for the metrics panel. |
+
+The host's `authorized_keys` entry for the deploy key is
+`restrict,command="/usr/local/bin/deploy-proxy"`. `restrict` disables pty,
+forwarding and agent use. To rotate: add a new key line, update the secret, deploy,
+then remove the old line.
+
+The host script `/usr/local/bin/deploy-proxy` is a copy of `scripts/deploy-proxy.sh`,
+installed by hand as root when the script itself changes. Check with
+`cmp /usr/local/bin/deploy-proxy scripts/deploy-proxy.sh` from a checkout.

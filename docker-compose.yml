@@ -1,0 +1,45 @@
+# Shared reverse proxy for the droplet. Managed from Jubstaaa/webgooh-proxy:
+# deploys run scripts/deploy-proxy.sh on the host, which installs this file and
+# the release it ships. Do not edit the copy on the host.
+services:
+    caddy:
+        image: caddy:2@sha256:4851e54a46b206517c574821bb5cc67f170d2156041e9fbc4c9193b45e84a75b
+        container_name: proxy-caddy
+        restart: unless-stopped
+        network_mode: host
+        # Host-only settings (named-account allow-list); kept out of git. See README.
+        env_file: ./proxy.env
+        command: caddy run --config /etc/caddy/current/Caddyfile --adapter caddyfile
+        healthcheck:
+            test:
+                [
+                    'CMD',
+                    'wget', '-q', '-O', '/dev/null', '-T', '3',
+                    'http://127.0.0.1:2019/config/',
+                ]
+            interval: 30s
+            timeout: 5s
+            retries: 3
+            start_period: 10s
+        # Without this Docker keeps stdout forever — this log had already reached 40MB.
+        logging:
+            driver: json-file
+            options:
+                max-size: "10m"
+                max-file: "3"
+        volumes:
+            # The whole config directory, not one file: config/current is a symlink that
+            # each deploy swaps, and a bind mount of a single file or of the symlink's
+            # target would keep serving the release that was current at container start.
+            - ./config:/etc/caddy:ro
+            # Access logs live on the host so they survive container recreates.
+            - /var/log/caddy:/var/log/caddy
+            # Static sites served directly by Caddy (no container): ./sites/<name>
+            # is reachable as /srv/<name>.
+            - ./sites:/srv:ro
+            - caddy_data:/data
+            - caddy_config:/config
+
+volumes:
+    caddy_data:
+    caddy_config:
