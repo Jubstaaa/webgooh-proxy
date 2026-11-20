@@ -1,0 +1,24 @@
+{{httpInclude "/__beszel_document"}}
+<script>
+	/* Beszel's logout button only clears its own browser session, and the identity
+	   header would sign the very next request straight back in — the button looked
+	   broken because nothing it can reach decides anything. It does record the
+	   deliberate logout as sessionStorage "lo", so that write is the signal: catch
+	   it and finish the job where the session actually lives, at Cloudflare.
+
+	   The body is hidden on the way out because the app repaints its login form
+	   while the redirect is still in flight, which flashed a sign-in screen nobody
+	   was meant to see. Only the body is hidden, so the theme background stays. */
+	(function () {
+		var set = Storage.prototype.setItem
+		Storage.prototype.setItem = function (key, value) {
+			set.apply(this, arguments)
+			if (this === window.sessionStorage && key === 'lo' && value === 't') {
+				var hide = document.createElement('style')
+				hide.textContent = 'body{visibility:hidden!important}'
+				document.head.appendChild(hide)
+				window.location.replace('/_logout')
+			}
+		}
+	})()
+</script>

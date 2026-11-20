@@ -1,0 +1,543 @@
+# Cloudflare fronts every site here except acwistanbul.com, so the real
+# visitor address arrives in CF-Connecting-IP / X-Forwarded-For rather than
+# on the socket. trusted_proxies makes Caddy resolve it into {client_ip} and
+# log it, instead of recording a Cloudflare edge address for every request.
+# Refresh these ranges from https://www.cloudflare.com/ips if CF changes them.
+{
+	servers {
+		trusted_proxies static 173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22 2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32
+	}
+}
+
+# Abort anything whose real source is not Cloudflare (or the local/docker
+# network, for health checks). Without this, Access and the WAF are bypassable
+# by anyone who sends the right Host header straight to the droplet IP — the
+# origin answered /admin with a 200 that way before this snippet existed.
+# Imported only by the origin-certificate sites: acwistanbul.com is not behind
+# Cloudflare yet and would be locked out of its own Let's Encrypt renewal.
+(cfonly) {
+	@notcf not remote_ip 173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22 2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32 127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
+	# Wrapped in handle rather than a bare `abort`: Caddy evaluates directives in
+	# a hard-coded order, not source order, and the static sites build their
+	# routing out of handle blocks, which outranked a top-level abort and served
+	# the request anyway. A handle joins that same mutually exclusive group, and
+	# because this import sits at the top of every site it is matched first.
+	handle @notcf {
+		abort
+	}
+}
+
+# Access logs for every site, in one rolling JSON file. Caddy rotates it itself,
+# so it cannot grow without bound the way the container stdout log did. Read a
+# single site out of it with:
+#   jq -c "select(.request.host==\"example.com\")" /var/log/caddy/access.log
+(access_log) {
+	log {
+		output file /var/log/caddy/access.log {
+			roll_size 20MiB
+			roll_keep 200
+			roll_keep_for 168h
+		}
+		format json
+	}
+}
+
+# Hide stack fingerprints on every app response.
+(secure_headers) {
+	header {
+		-Server
+		-Via
+		-X-Powered-By
+	}
+}
+
+# Baseline hardening for the static sites: each one sets its own CSP in the
+# page, but HSTS, framing and the rest can only come from response headers.
+(static_security_headers) {
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		X-Frame-Options "SAMEORIGIN"
+		# A meta CSP cannot carry frame-ancestors; this header-only policy adds just
+		# that directive and intersects with the page's own CSP.
+		Content-Security-Policy "frame-ancestors 'self'"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+	}
+}
+
+# ── ACW (acwistanbul.com) — Let's Encrypt, no CDN in front ──
+# Host-network Caddy, so {remote_host} is the real visitor IP; it is forced into
+# X-Forwarded-For / X-Real-IP so the app's per-IP rate limiting is unspoofable.
+www.acwistanbul.com {
+	import access_log
+	import secure_headers
+	# Backstop for the app's own per-route caps; the largest legit body is a CV upload.
+	request_body {
+		max_size 20MB
+	}
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:3000 {
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Real-IP {remote_host}
+		header_down -X-Powered-By
+	}
+}
+
+acwistanbul.com {
+	import access_log
+	redir https://www.acwistanbul.com{uri} permanent
+}
+
+# ── webgooh (webgooh.tech) — behind Cloudflare, origin cert ──
+webgooh.tech, www.webgooh.tech {
+	import access_log
+	import cfonly
+	encode gzip zstd
+	import secure_headers
+
+	# Cronicle's external_user_api is parked on this host because it has to answer
+	# two different callers at the same address: the Cronicle container asks it
+	# server-side who a request belongs to, and the browser is sent here with
+	# ?logout=1 when someone signs out — Cronicle hands the client the very same URL
+	# it uses itself, so an address only the container could resolve left the logout
+	# button pointing at nowhere. This host is behind Cloudflare but not behind
+	# Access, which is what makes both callers work.
+	#
+	# Publishing it gives nothing away: it only echoes a username derived from the
+	# cf_email cookie on the request, and that cookie is written by the cron vhost
+	# from the header Access sets. Naming yourself here buys no access to anything.
+	@cronid_logout {
+		path /_cronicle-identity*
+		query logout=1
+	}
+	@cronid path /_cronicle-identity*
+
+	# Signing out of Cronicle alone would be theatre: the next page load would be
+	# logged straight back in from the Access header. So logout means logout of
+	# Cloudflare, which is the session that actually decides anything here. One call
+	# does it — Cloudflare revokes the session across every application, and asking
+	# a second endpoint to repeat it only answers "Failed to log out".
+	# returnTo is undocumented but honoured (verified: it answers 302 to the target),
+	# and without it Cloudflare leaves the visitor on its own "successfully logged
+	# out" page. Landing back on the panel means the next thing they see is the
+	# Access prompt, which is the point of having logged out.
+	handle @cronid_logout {
+		redir https://cron.webgooh.tech/cdn-cgi/access/logout?returnTo=https%3A%2F%2Fcron.webgooh.tech%2F
+	}
+
+	handle @cronid {
+		root * /srv/cronicle-identity
+		rewrite * /identity.html
+		templates
+		file_server
+	}
+
+	handle {
+		reverse_proxy 127.0.0.1:3001 {
+			header_up X-Real-IP {client_ip}
+			header_up X-Forwarded-For {client_ip}
+		}
+	}
+}
+
+# ── portfolio (ilkerbalcilar.com) — behind Cloudflare, origin cert ──
+# Deliberately no X-Forwarded-For override here: this host is proxied by
+# Cloudflare, so {remote_host} is a Cloudflare edge IP, not the visitor. Forcing
+# it would overwrite the real client address Cloudflare already sends in
+# CF-Connecting-IP / X-Forwarded-For. Nothing in this app rate-limits by IP.
+ilkerbalcilar.com {
+	import access_log
+	import cfonly
+	tls /etc/caddy/certs/ilkerbalcilar.com.pem /etc/caddy/certs/ilkerbalcilar.com.key
+	encode gzip zstd
+	import secure_headers
+	# Hold requests while a deploy recreates the container instead of answering
+	# 502: the new one is up within a few seconds.
+	reverse_proxy 127.0.0.1:3002 {
+		lb_try_duration 30s
+		lb_try_interval 250ms
+	}
+}
+
+# Apex is canonical (content/site.json, metadataBase). Vercel served this as a
+# 307; a canonical host redirect belongs at 301.
+www.ilkerbalcilar.com {
+	import access_log
+	import cfonly
+	tls /etc/caddy/certs/ilkerbalcilar.com.pem /etc/caddy/certs/ilkerbalcilar.com.key
+	handle {
+		redir https://ilkerbalcilar.com{uri} permanent
+	}
+}
+
+# ── tailwind-hitslop docs (hitslop.ilkerbalcilar.com) — static, no app server ──
+# A four-file Vite build. Covered by the *.ilkerbalcilar.com origin certificate
+# already on disk, so this host needed no new certificate and no registrar step.
+# No try_files fallback on purpose: the docs are a single page, so an unknown path
+# should 404 rather than return the page with a 200.
+hitslop.ilkerbalcilar.com {
+	import access_log
+	import cfonly
+	tls /etc/caddy/certs/ilkerbalcilar.com.pem /etc/caddy/certs/ilkerbalcilar.com.key
+	encode gzip zstd
+	import secure_headers
+	import static_security_headers
+	root * /srv/hitslop
+	# Vite content-hashed filenames.
+	header /assets/* Cache-Control "public, max-age=31536000, immutable"
+	file_server
+}
+
+# ── hono-telescope demo (hono-telescope.ilkerbalcilar.com) — behind Cloudflare, origin cert ──
+# The example app out of the hono-telescope repository, so the published package has a
+# dashboard anyone can open from its README. Covered by the *.ilkerbalcilar.com origin
+# certificate already on disk, so this host needed no new certificate either.
+# The dashboard is deliberately unauthenticated and its store is a 500-entry in-memory
+# ring, so cfonly is the only access control this host needs.
+hono-telescope.ilkerbalcilar.com {
+	import access_log
+	import cfonly
+	tls /etc/caddy/certs/ilkerbalcilar.com.pem /etc/caddy/certs/ilkerbalcilar.com.key
+	encode gzip zstd
+	import secure_headers
+	reverse_proxy 127.0.0.1:3006
+}
+
+# ── statbox (statbox.live) — behind Cloudflare, origin cert ──
+# No X-Forwarded-For override: this host is proxied by Cloudflare, so {remote_host}
+# is a Cloudflare edge IP rather than the visitor, and forcing it would overwrite
+# the real address CF already sends. Nothing here rate-limits by IP.
+statbox.live {
+	import access_log
+	import cfonly
+	tls /etc/caddy/certs/statbox.live.pem /etc/caddy/certs/statbox.live.key
+	encode gzip zstd
+	import secure_headers
+	reverse_proxy 127.0.0.1:3003
+}
+
+www.statbox.live {
+	import access_log
+	import cfonly
+	tls /etc/caddy/certs/statbox.live.pem /etc/caddy/certs/statbox.live.key
+	handle {
+		redir https://statbox.live{uri} permanent
+	}
+}
+
+# ── pixel-guess (pixelguessgame.com) — static SPA, no app server ──
+# A Vite build served straight off disk. The ~1900 game images are NOT here:
+# they come from the pixelguess Space CDN, which is why this directory is under
+# a megabyte. CI rsyncs apps/web/dist into /opt/proxy/sites/pixelguess.
+#
+pixelguessgame.com {
+	import access_log
+	import cfonly
+	tls /etc/caddy/certs/pixelguessgame.com.pem /etc/caddy/certs/pixelguessgame.com.key
+	encode gzip zstd
+	import secure_headers
+	import static_security_headers
+	root * /srv/pixelguess
+
+	# Vite writes content-hashed filenames here, so they can be cached forever.
+	# Deliberately no index.html fallback: a stale hash should 404 loudly rather
+	# than return HTML with a 200 that then fails to parse as JavaScript.
+	handle /assets/* {
+		header Cache-Control "public, max-age=31536000, immutable"
+		file_server
+	}
+
+	handle {
+		# React Router owns routing, so any unknown path serves the shell. The
+		# shell itself must always be revalidated, or a deploy leaves clients
+		# holding an index.html that points at asset hashes that no longer exist.
+		header Cache-Control "public, max-age=0, must-revalidate"
+		try_files {path} /index.html
+		file_server
+	}
+}
+
+www.pixelguessgame.com {
+	import access_log
+	import cfonly
+	tls /etc/caddy/certs/pixelguessgame.com.pem /etc/caddy/certs/pixelguessgame.com.key
+	handle {
+		redir https://pixelguessgame.com{uri} permanent
+	}
+}
+
+# ── yasinrofcanin.com — Next static export, no app server ──
+# The site prerenders entirely (no API routes, no server actions), so `next
+# build` with output: "export" produces plain files and there is no container.
+# Photographs are not here either — they come from the yasinrofcanin Space CDN.
+#
+# beta.yasinrofcanin.com is deliberately absent: it is a separate Payload app
+# that stays on Vercel, reached through its own DNS record.
+yasinrofcanin.com {
+	import access_log
+	import cfonly
+	tls /etc/caddy/certs/yasinrofcanin.com.pem /etc/caddy/certs/yasinrofcanin.com.key
+	encode gzip zstd
+	import secure_headers
+	import static_security_headers
+	root * /srv/yasinrofcanin
+
+	# Astro writes content-hashed filenames here, safe to cache forever.
+	handle /_astro/* {
+		header Cache-Control "public, max-age=31536000, immutable"
+		file_server
+	}
+
+	handle {
+		# The HTML must always be revalidated, or a deploy leaves clients holding
+		# markup that references chunk hashes which no longer exist.
+		header Cache-Control "public, max-age=0, must-revalidate"
+		try_files {path} {path}.html {path}/index.html
+		file_server
+	}
+
+	handle_errors {
+		rewrite * /404.html
+		file_server
+	}
+}
+
+www.yasinrofcanin.com {
+	import access_log
+	import cfonly
+	tls /etc/caddy/certs/yasinrofcanin.com.pem /etc/caddy/certs/yasinrofcanin.com.key
+	# Vercel answered 308 here; a canonical host redirect belongs at 301, which is
+	# what the other migrated sites use.
+	handle {
+		redir https://yasinrofcanin.com{uri} permanent
+	}
+}
+
+# ── beta.yasinrofcanin.com — Next static export, no app server ──
+# This was a Payload CMS app on MongoDB. The CMS and the database are gone: the
+# content was exported into the repo, so this is now plain prerendered files.
+# Covered by the same *.yasinrofcanin.com origin certificate as the apex.
+beta.yasinrofcanin.com {
+	import access_log
+	import cfonly
+	tls /etc/caddy/certs/yasinrofcanin.com.pem /etc/caddy/certs/yasinrofcanin.com.key
+	encode gzip zstd
+	import secure_headers
+	import static_security_headers
+	root * /srv/yasinrofcanin-beta
+
+	handle /_next/static/* {
+		header Cache-Control "public, max-age=31536000, immutable"
+		file_server
+	}
+
+	handle {
+		header Cache-Control "public, max-age=0, must-revalidate"
+		try_files {path} {path}.html {path}/index.html
+		file_server
+	}
+
+	handle_errors {
+		rewrite * /404.html
+		file_server
+	}
+}
+
+# Loopback health check for the deploy workflows (Host: localhost -> ACW app).
+http://localhost {
+	reverse_proxy 127.0.0.1:3000
+}
+
+# Content-hashed filenames are safe to cache forever. The HTML never is: a
+# deploy would otherwise leave clients holding markup that references chunk
+# hashes which no longer exist.
+(next_export_files) {
+	handle /_next/static/* {
+		header Cache-Control "public, max-age=31536000, immutable"
+		file_server
+	}
+
+	handle {
+		header Cache-Control "public, max-age=0, must-revalidate"
+		try_files {path} {path}.html {path}/index.html
+		file_server
+	}
+
+	handle_errors {
+		rewrite * /404.html
+		file_server
+	}
+}
+
+# ── metrics (Beszel) — system and container metrics, monitoring only ──
+# Deliberately not named after the tool: swap Beszel out and the hostname stays
+# true. flush_interval -1 because the hub pushes live updates over SSE.
+metrics.webgooh.tech {
+	# Cloudflare Access sits in front of this hostname and answers Let's Encrypt's
+	# validation request with a login redirect, so a public certificate cannot be
+	# issued here — which is why the old domain used a Cloudflare origin certificate
+	# for the panels. Caddy's own CA holds the line until one exists for this domain;
+	# swap this for `tls /etc/caddy/certs/webgooh.tech.pem …key` once it does.
+	tls internal
+	import access_log
+	import cfonly
+	encode gzip zstd
+	import secure_headers
+
+	header {
+		X-Robots-Tag "noindex, nofollow"
+		X-Frame-Options "DENY"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+	}
+
+	# Beszel logs people in from the header Access sets, but it cannot register
+	# anyone: PocketBase discards an OIDC email unless the provider also sends
+	# email_verified, Access never sends it, and that check is hard-coded, so the
+	# OIDC path answers 400 with "email: cannot be blank". Rather than registering
+	# every new person by hand, anyone Access allows who is not one of the accounts
+	# below arrives as a single shared read-only identity. Adding someone to the
+	# Access policy is then the only step there is.
+	#
+	# The list is not an access list — Access already decided that. It exists so
+	# these three keep their own accounts, and with them their own alerts and admin
+	# rights. Touch it to promote someone, never to let someone in.
+	# Signing out inside the panel only clears its own browser session; the next
+	# request is authenticated again from the header Access sets, which reads as a
+	# logout button that does nothing. This ends the Cloudflare session instead,
+	# which Cloudflare revokes across every application, and returns here — where
+	# Access asks for a login.
+	handle /_logout* {
+		redir https://{host}/cdn-cgi/access/logout?returnTo=https%3A%2F%2F{host}%2F
+	}
+
+	# Beszel's document is passed through a template so a handful of lines can be
+	# appended to it — see /opt/proxy/sites/beszel-shell/shell.html for why. Matching
+	# on Accept rather than a path list catches every entry point the app has,
+	# including deep links like /system/foo, without guessing at its routes.
+	#
+	# This internal route is what the template pulls the real document from, and is
+	# listed first so the template's own subrequest cannot match @document and
+	# recurse into itself.
+	handle /__beszel_document {
+		rewrite * /
+		reverse_proxy 127.0.0.1:8090
+	}
+
+	@document {
+		header Accept *text/html*
+		not path /api/* /assets/* /static/* /__beszel_document* /_ /_/*
+	}
+
+	handle @document {
+		root * /srv/beszel-shell
+		rewrite * /shell.html
+		templates
+		file_server
+	}
+
+	# The named-account list is injected from the host's proxy.env (BESZEL_ALLOWED_EMAILS),
+	# so the addresses never live in git. Unset means no named accounts: everyone gets the shared viewer.
+	@named_user header_regexp Cf-Access-Authenticated-User-Email (?i)^({$BESZEL_ALLOWED_EMAILS})$
+
+	handle @named_user {
+		reverse_proxy 127.0.0.1:8090 {
+			flush_interval -1
+		}
+	}
+
+	handle {
+		reverse_proxy 127.0.0.1:8090 {
+			flush_interval -1
+			header_up Cf-Access-Authenticated-User-Email viewer@webgooh.tech
+		}
+	}
+}
+
+# ── brief (brief.ilkerbalcilar.com) — Next static export, no app server ──
+# A weekly digest of React and Next.js commits. GitHub Actions builds it on a
+# Tuesday cron and rsyncs `out/` here, so there is nothing to run: the whole site
+# is a handful of prerendered pages. Deliberately not a container — this box has
+# ~160MB free and a Next server would cost ~110MB of that to serve files that
+# never change between builds.
+#
+# Covered by the *.ilkerbalcilar.com origin certificate already on disk for the
+# portfolio and hitslop, so no new certificate and no registrar step.
+brief.ilkerbalcilar.com {
+	import access_log
+	import cfonly
+	tls /etc/caddy/certs/ilkerbalcilar.com.pem /etc/caddy/certs/ilkerbalcilar.com.key
+	encode gzip zstd
+	import secure_headers
+	import static_security_headers
+	root * /srv/brief
+	import next_export_files
+}
+
+# ── standup-mr remote (standup.ilkerbalcilar.com) — MCP connector for claude.ai ──
+# One Bun container (/opt/standup-mr) serving OAuth, the connect page and /mcp.
+# CF-only ingress matters here beyond hygiene: the app rate-limits by
+# CF-Connecting-IP, which only Cloudflare may set. Covered by the existing
+# *.ilkerbalcilar.com origin certificate.
+standup.ilkerbalcilar.com {
+	import access_log
+	import cfonly
+	tls /etc/caddy/certs/ilkerbalcilar.com.pem /etc/caddy/certs/ilkerbalcilar.com.key
+	encode gzip zstd
+	import secure_headers
+	reverse_proxy 127.0.0.1:3007
+}
+
+# ── cron (Cronicle) — scheduled job dashboard ──
+# Same conventions as metrics: generic hostname (swap the tool, keep the name),
+# origin cert already covers *.webgooh.tech, noindex, CF-only ingress.
+# flush_interval -1 because the UI streams live job updates over websockets.
+cron.webgooh.tech {
+	# Cloudflare Access sits in front of this hostname and answers Let's Encrypt's
+	# validation request with a login redirect, so a public certificate cannot be
+	# issued here — which is why the old domain used a Cloudflare origin certificate
+	# for the panels. Caddy's own CA holds the line until one exists for this domain;
+	# swap this for `tls /etc/caddy/certs/webgooh.tech.pem …key` once it does.
+	tls internal
+	import access_log
+	import cfonly
+	encode gzip zstd
+	import secure_headers
+
+	header {
+		X-Robots-Tag "noindex, nofollow"
+		X-Frame-Options "DENY"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+	}
+
+	# Cronicle cannot read an auth header, but its external_user_api hook forwards
+	# whatever Cookie header it received to an endpoint of our choosing and logs in
+	# whoever that endpoint names. So the identity is smuggled in as a cookie here.
+	#
+	# The whole Cookie header is replaced rather than appended to, which is the
+	# point: a visitor cannot supply their own cf_email, because theirs is thrown
+	# away and rebuilt from the header Access sets. Cronicle keeps its session in
+	# the browser's local storage, not in a cookie, so nothing is lost by dropping
+	# the originals.
+	reverse_proxy 127.0.0.1:3012 {
+		flush_interval -1
+		header_up Cookie "cf_email={http.request.header.Cf-Access-Authenticated-User-Email}"
+	}
+}
+
+# ── Cronicle identity endpoint — answers "who is this request", nothing else ──
+# Cronicle's external_user_api points here. It replies with a username and the
+# privileges that user should have, and Cronicle creates the account if it has
+# never seen it, which is what makes adding someone to the Access policy the only
+# step needed. Named accounts keep their existing usernames and admin rights;
+# everyone else arrives as their own email address with every privilege at zero,
+# so a new person can watch the schedule but not touch it.
+#
+# NOTE: Cronicle rewrites a user's privileges from this response on every login,
+# so removing someone from the named list demotes them on their next visit.
+#
+# Bound to the docker bridge address because Cronicle runs in a container and
+# reaches the host as host.docker.internal. Nothing off this machine can route to
+# 172.17.0.1, and the reply is worthless without a cookie the cron vhost writes.
