@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Exercises scripts/deploy-proxy.sh against a throwaway /opt/proxy tree, with fake
 # docker and curl on PATH. Covers accept, reject, rollback, drift, compose changes
-# and pruning. Runs in CI on every pull request; touches nothing outside its temp dir.
+# pruning, and the apply-env entry point. Runs in CI on every pull request; touches nothing outside its temp dir.
 set -Eeuo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -26,6 +26,10 @@ to_host_path() { printf '%s' "${1/#\/etc\/caddy/$FAKE_CONFIG_ROOT}"; }
 if [[ $1 == compose ]]; then
     echo "compose $*" >>"$FAKE_STATE/compose.log"
     [[ -z ${FAKE_COMPOSE_FAIL:-} ]] || exit 1
+    # `compose run ... caddy validate`: the throwaway container sees proxy.env
+    if [[ $* == *" run "* ]] && grep -q INVALID_ENV "$FAKE_PROXY/proxy.env"; then
+        exit 1
+    fi
     if [[ $* == *" up "* ]]; then
         # a recreated container starts on config/current, so its admin config is that file
         jq -n --arg sha "$(sha256sum "$FAKE_CONFIG_ROOT/current/Caddyfile" | cut -d' ' -f1)" '{apps: {file: $sha}}' >"$FAKE_STATE/admin.json"
@@ -58,7 +62,9 @@ cat >"$bin/curl" <<'FAKE'
 url=""
 for a in "$@"; do [[ $a == https://* ]] && url=$a; done
 host=${url#https://}; host=${host%%/*}
-if [[ ${FAKE_BAD_HOST:-} == "$host" ]]; then printf 503; else printf 200; fi
+if [[ ${FAKE_BAD_HOST:-} == "$host" ]]; then printf 503
+elif [[ $host == b.test ]] && grep -qs BREAKS_B "$FAKE_PROXY/proxy.env"; then printf 503
+else printf 200; fi
 FAKE
 chmod +x "$fake_docker" "$bin/curl"
 
@@ -66,7 +72,8 @@ export DEPLOY_PROXY_ROOT=$proxy
 export DEPLOY_PROXY_DOCKER=$fake_docker
 export DEPLOY_PROXY_LOCK=$work/deploy.lock
 export DEPLOY_PROXY_SMOKE_DELAY=0
-export FAKE_CONFIG_ROOT=$proxy/config FAKE_STATE=$state
+export DEPLOY_PROXY_ENV_STATE=$work/env-state DEPLOY_PROXY_ENV_WAIT=2
+export FAKE_CONFIG_ROOT=$proxy/config FAKE_STATE=$state FAKE_PROXY=$proxy
 export PATH=$bin:$PATH
 
 # make_release <name> <caddy marker> <compose marker> <helper marker>
@@ -177,6 +184,61 @@ check "current is the last release" is_current "$(sha_of 21)"
 check "older releases pruned to ten" bash -c "[[ \$(ls -1 '$proxy/config/releases' | grep -c '^[0-9a-f]\{40\}\$') -le 10 ]]"
 check "rollback target kept after pruning" test -d "$proxy/config/releases/$(sha_of 20)"
 check "re-deploy of an existing release succeeds" deploy_as "$(sha_of 20)" "$(tarball r20)"
+
+# 8. apply-env: proxy.env rendered by the agent is validated, applied, or rolled back
+envs=$work/env-state
+apply_env() { "$deploy" apply-env >/dev/null 2>"$work/last.err"; }
+ups() { grep -c "up -d --force-recreate --wait caddy" "$state/compose.log" || true; }
+runs() { grep -c " run --rm " "$state/compose.log" || true; }
+printf "A='one'\n" >"$proxy/proxy.env"
+check "refuses without an applied baseline" bash -c "! '$deploy' apply-env >/dev/null 2>&1"
+mkdir -p "$envs"
+cp "$proxy/proxy.env" "$envs/proxy.env.applied"
+sha256sum "$proxy/proxy.env" | cut -d' ' -f1 >"$envs/proxy.sha"
+u0=$(ups)
+check "unchanged env is a no-op" apply_env
+check "no recreate for an unchanged env" test "$(ups)" = "$u0"
+
+printf "A='two'\n" >"$proxy/proxy.env"
+check "the deploy key cannot reach apply-env" bash -c "! SSH_ORIGINAL_COMMAND='deploy-proxy apply-env' '$deploy' apply-env </dev/null >/dev/null 2>&1"
+check "no recreate from the forced command" test "$(ups)" = "$u0"
+
+check "applies a changed env" apply_env
+check "validated in a throwaway container" test "$(runs)" -ge 1
+check "recreated once" test "$(ups)" = $((u0 + 1))
+check "applied copy updated" cmp -s "$proxy/proxy.env" "$envs/proxy.env.applied"
+check "hash recorded" test "$(cat "$envs/proxy.sha")" = "$(sha256sum "$proxy/proxy.env" | cut -d' ' -f1)"
+check "apply logged" grep -q "apply-env: APPLIED" "$proxy/deploy.log"
+good=$(cat "$proxy/proxy.env")
+
+u1=$(ups)
+printf "A='INVALID_ENV'\n" >"$proxy/proxy.env"
+check "rejects an env that fails validate" bash -c "! '$deploy' apply-env >/dev/null 2>&1"
+check "no recreate after a validate failure" test "$(ups)" = "$u1"
+check "previous env restored after validate failure" test "$(cat "$proxy/proxy.env")" = "$good"
+r1=$(runs)
+printf "A='INVALID_ENV'\n" >"$proxy/proxy.env"
+check "a rejected env is refused again" bash -c "! '$deploy' apply-env >/dev/null 2>&1"
+check "without re-validating it" test "$(runs)" = "$r1"
+check "and restored again" test "$(cat "$proxy/proxy.env")" = "$good"
+
+: >"$proxy/proxy.env"
+check "rejects an empty render" bash -c "! '$deploy' apply-env >/dev/null 2>&1"
+check "previous env restored after empty render" test "$(cat "$proxy/proxy.env")" = "$good"
+
+printf "A='BREAKS_B'\n" >"$proxy/proxy.env"
+check "rolls back an env that fails smoke" bash -c "! '$deploy' apply-env >/dev/null 2>&1"
+check "recreated twice (apply and rollback)" test "$(ups)" = $((u1 + 2))
+check "previous env restored after smoke failure" test "$(cat "$proxy/proxy.env")" = "$good"
+check "hash still the applied one" test "$(cat "$envs/proxy.sha")" = "$(sha256sum "$proxy/proxy.env" | cut -d' ' -f1)"
+check "env rollback logged" grep -q "apply-env: ROLLBACK" "$proxy/deploy.log"
+
+exec 8>"$work/deploy.lock"
+flock 8
+printf "A='three'\n" >"$proxy/proxy.env"
+check "waits for a running deploy, then gives up" bash -c "! '$deploy' apply-env >/dev/null 2>&1"
+flock -u 8
+check "applies once the lock is free" apply_env
 
 echo
 if (( failures )); then

@@ -57,7 +57,7 @@ flowchart LR
 | `smoke/baseline.txt` | Expected HTTPS status per hostname, checked on the host after every deploy. |
 | `scripts/check.sh` | The gate (format, validate, policy). Same script in CI and before each deploy. |
 | `scripts/policy.sh` | Edge policy on `caddy adapt` JSON. |
-| `scripts/deploy-proxy.sh` | Host-side forced command: install, switch, reload, smoke, roll back. |
+| `scripts/deploy-proxy.sh` | Host-side forced command: install, switch, reload, smoke, roll back. `apply-env` applies a changed `proxy.env` the same way. |
 | `scripts/test/` | Tests for the host script, run in CI with fake `docker` and `curl`. |
 
 Not in this repo: TLS private keys (on the host only), and the release output of
@@ -85,11 +85,29 @@ current at container start.
 ### Host-only settings (`proxy.env`)
 
 `BESZEL_ALLOWED_EMAILS` is the pipe-separated list of named accounts that the
-metrics panel recognises. It is kept out of git on purpose. The file is
-`/opt/proxy/proxy.env`, mode `0600`, owned by root, and is passed to the container
-with `env_file`. Caddy substitutes it at load time with `{$BESZEL_ALLOWED_EMAILS}`.
-CI uses a dummy value, so validation never sees the real list. Changing the list
-means editing that file and running a deploy (or `docker compose up -d caddy`).
+metrics panel recognises; the `CRONICLE_USER_*` keys are the identities the
+Cronicle helper page answers with. They are kept out of git on purpose. The file
+is `/opt/proxy/proxy.env`, mode `0600`, owned by root, and is passed to the
+container with `env_file`. Caddy substitutes the values when it loads the config.
+CI uses dummy values, so validation never sees the real list.
+
+The file is rendered by `infisical-agent` from Infisical (`droplet-deploy`, `prod`,
+`/proxy`). To change a value, change it in Infisical. Within a minute the agent
+re-renders the file and runs `deploy-proxy apply-env`, which:
+
+1. does nothing if the file's hash equals the last applied one;
+2. refuses an empty render, and a render it already rejected;
+3. runs `caddy validate` on the current release in a throwaway container with the
+   same image, mounts and `env_file` (`docker compose run`);
+4. recreates `proxy-caddy` (Caddy reads env only at container creation) and
+   smokes every hostname against the current release's `smoke/baseline.txt`;
+5. on any failure puts the last applied `proxy.env` back (kept as
+   `/var/lib/infisical-agent/proxy.env.applied`), recreates again if it had
+   already recreated, and logs `apply-env: ROLLBACK` to `deploy.log`. Fix the
+   value in Infisical; the next render is tried again.
+
+It takes the deploy lock, so it never runs alongside a deploy. The deploy key
+cannot trigger it: the forced command gets no arguments.
 
 ## Add a site
 
@@ -143,7 +161,7 @@ Then fix `main` through a PR and redeploy it. Never edit a file under
 | `PROXY_DEPLOY_HOST` | repo secret | Address of the host, used only by `deploy.yml`. |
 | `PROXY_DEPLOY_KNOWN_HOSTS` | repo secret | Pinned host key for that address. |
 | `PROXY_DEPLOY_SSH_KEY` | repo secret | Private key for the forced command. Only the public half exists on the host. |
-| `BESZEL_ALLOWED_EMAILS` | host file `/opt/proxy/proxy.env` | Named accounts for the metrics panel. |
+| `BESZEL_ALLOWED_EMAILS`, `CRONICLE_USER_*` | Infisical `droplet-deploy` / `prod` / `/proxy`, rendered to `/opt/proxy/proxy.env` | Named accounts for the metrics panel and the Cronicle identity page. |
 
 The host's `authorized_keys` entry for the deploy key is
 `restrict,command="/usr/local/bin/deploy-proxy"`. `restrict` disables pty,
@@ -151,5 +169,7 @@ forwarding and agent use. To rotate: add a new key line, update the secret, depl
 then remove the old line.
 
 The host script `/usr/local/bin/deploy-proxy` is a copy of `scripts/deploy-proxy.sh`,
-installed by hand as root when the script itself changes. Check with
+installed by hand as root when the script itself changes (deliberately not by the
+deploy: a release that could replace its own forced command would turn the deploy
+key into root on the host). Install it from `main` after the PR merges. Check with
 `cmp /usr/local/bin/deploy-proxy scripts/deploy-proxy.sh` from a checkout.
