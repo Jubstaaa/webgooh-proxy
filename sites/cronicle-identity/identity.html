@@ -1,10 +1,10 @@
 {{- $email := .Cookie "cf_email" -}}
-{{- if and $email (eq $email (env "CRONICLE_USER_1_EMAIL")) -}}
-{"username":"{{env "CRONICLE_USER_1_USERNAME"}}","user":{"full_name":"{{env "CRONICLE_USER_1_FULL_NAME"}}","email":"{{$email}}","privileges":{"admin":1}}}
-{{- else if and $email (eq $email (env "CRONICLE_USER_2_EMAIL")) -}}
-{"username":"{{env "CRONICLE_USER_2_USERNAME"}}","user":{"full_name":"{{env "CRONICLE_USER_2_FULL_NAME"}}","email":"{{$email}}","privileges":{"admin":1}}}
-{{- else if and $email (eq $email (env "CRONICLE_USER_3_EMAIL")) -}}
-{"username":"{{env "CRONICLE_USER_3_USERNAME"}}","user":{"full_name":"{{env "CRONICLE_USER_3_FULL_NAME"}}","email":"{{$email}}","privileges":{"admin":1}}}
+{{- if and $email (eq $email (env "OPS_USER_1_EMAIL")) -}}
+{"username":"{{env "OPS_USER_1_USERNAME"}}","user":{"full_name":"{{env "OPS_USER_1_FULL_NAME"}}","email":"{{$email}}","privileges":{"admin":1}}}
+{{- else if and $email (eq $email (env "OPS_USER_2_EMAIL")) -}}
+{"username":"{{env "OPS_USER_2_USERNAME"}}","user":{"full_name":"{{env "OPS_USER_2_FULL_NAME"}}","email":"{{$email}}","privileges":{"admin":1}}}
+{{- else if and $email (eq $email (env "OPS_USER_3_EMAIL")) -}}
+{"username":"{{env "OPS_USER_3_USERNAME"}}","user":{"full_name":"{{env "OPS_USER_3_FULL_NAME"}}","email":"{{$email}}","privileges":{"admin":1}}}
 {{- else if $email -}}
 {"username":"{{$email}}","user":{"full_name":"{{$email}}","email":"{{$email}}","privileges":{}}}
 {{- else -}}

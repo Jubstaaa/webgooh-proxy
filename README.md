@@ -84,12 +84,16 @@ current at container start.
 
 ### Host-only settings (`proxy.env`)
 
-`BESZEL_ALLOWED_EMAILS` is the pipe-separated list of named accounts that the
-metrics panel recognises; the `CRONICLE_USER_*` keys are the identities the
-Cronicle helper page answers with. They are kept out of git on purpose. The file
-is `/opt/proxy/proxy.env`, mode `0600`, owned by root, and is passed to the
+`OPS_USER_{1,2,3}_{EMAIL,USERNAME,FULL_NAME}` are the named operator accounts.
+Both panels use the same keys: the metrics vhost passes the Access email through
+to Beszel only when it equals one of the `OPS_USER_n_EMAIL` values (exact match;
+anyone else is shown the shared viewer), and the Cronicle identity page answers
+with that user's username and full name. They are kept out of git on purpose. The
+file is `/opt/proxy/proxy.env`, mode `0600`, owned by root, and is passed to the
 container with `env_file`. Caddy substitutes the values when it loads the config.
-CI uses dummy values, so validation never sees the real list.
+CI uses dummy values (`ops{1,2,3}@example.invalid`), so validation never sees the
+real list, and the edge policy refuses any regex, empty or wildcard match on the
+Access email header.
 
 The file is rendered by `infisical-agent` from Infisical (`droplet-deploy`, `prod`,
 `/proxy`). To change a value, change it in Infisical. Within a minute the agent
@@ -161,7 +165,7 @@ Then fix `main` through a PR and redeploy it. Never edit a file under
 | `PROXY_DEPLOY_HOST` | repo secret | Address of the host, used only by `deploy.yml`. |
 | `PROXY_DEPLOY_KNOWN_HOSTS` | repo secret | Pinned host key for that address. |
 | `PROXY_DEPLOY_SSH_KEY` | repo secret | Private key for the forced command. Only the public half exists on the host. |
-| `BESZEL_ALLOWED_EMAILS`, `CRONICLE_USER_*` | Infisical `droplet-deploy` / `prod` / `/proxy`, rendered to `/opt/proxy/proxy.env` | Named accounts for the metrics panel and the Cronicle identity page. |
+| `OPS_USER_{1,2,3}_{EMAIL,USERNAME,FULL_NAME}` | Infisical `droplet-deploy` / `prod` / `/proxy`, rendered to `/opt/proxy/proxy.env` | Named operator accounts for the metrics panel and the Cronicle identity page. |
 
 The host's `authorized_keys` entry for the deploy key is
 `restrict,command="/usr/local/bin/deploy-proxy"`. `restrict` disables pty,

@@ -437,9 +437,16 @@ metrics.webgooh.tech {
 		file_server
 	}
 
-	# The named-account list is injected from the host's proxy.env (BESZEL_ALLOWED_EMAILS),
-	# so the addresses never live in git. Unset means no named accounts: everyone gets the shared viewer.
-	@named_user header_regexp Cf-Access-Authenticated-User-Email (?i)^({$BESZEL_ALLOWED_EMAILS})$
+	# The named accounts come from the host's proxy.env (OPS_USER_n_EMAIL, the same keys
+	# the Cronicle identity page uses), so the addresses never live in git. Exact,
+	# case-sensitive match: Access sends the address lowercase, and anything else
+	# falls through to the shared viewer. An unset key becomes a value no email can
+	# equal, so a missing account matches nobody.
+	@named_user {
+		header Cf-Access-Authenticated-User-Email {$OPS_USER_1_EMAIL:ops-user-unset}
+		header Cf-Access-Authenticated-User-Email {$OPS_USER_2_EMAIL:ops-user-unset}
+		header Cf-Access-Authenticated-User-Email {$OPS_USER_3_EMAIL:ops-user-unset}
+	}
 
 	handle @named_user {
 		reverse_proxy 127.0.0.1:8090 {

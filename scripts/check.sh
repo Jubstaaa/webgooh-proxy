@@ -29,7 +29,9 @@ echo "::endgroup::"
 
 echo "::group::caddy validate"
 docker run --rm \
-    -e "BESZEL_ALLOWED_EMAILS=${BESZEL_ALLOWED_EMAILS:-ci@example.invalid}" \
+    -e "OPS_USER_1_EMAIL=${OPS_USER_1_EMAIL:-ops1@example.invalid}" \
+    -e "OPS_USER_2_EMAIL=${OPS_USER_2_EMAIL:-ops2@example.invalid}" \
+    -e "OPS_USER_3_EMAIL=${OPS_USER_3_EMAIL:-ops3@example.invalid}" \
     -v "$PWD/Caddyfile:/etc/caddy/Caddyfile:ro" \
     -v "$fixtures/certs:/etc/caddy/certs:ro" \
     -v "$fixtures/srv:/srv:ro" \
