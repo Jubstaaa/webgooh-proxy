@@ -49,6 +49,24 @@ if [[ -n $bad_upstreams ]]; then
     violations=1
 fi
 
+# Named accounts are decided by the email Cloudflare Access sets. Only an exact match
+# on non-empty values is allowed: a regex assembled from host-only values is one
+# unescaped character away from matching more than intended, and an empty value
+# would turn the matcher into "header present".
+loose_identity=$(jq -r '
+    [.. | objects
+        | (select(has("header_regexp")) | .header_regexp | objects | keys[]
+            | select(ascii_downcase == "cf-access-authenticated-user-email") | "header_regexp"),
+          (select(has("header")) | .header | objects | to_entries[]
+            | select(.key | ascii_downcase == "cf-access-authenticated-user-email")
+            | select((.value // []) | length == 0 or any(. == "" or test("[*]")))
+            | "empty or wildcard header value")]
+    | unique | join(", ")' "$json")
+if [[ -n $loose_identity ]]; then
+    echo "::error::loose match on Cf-Access-Authenticated-User-Email: $loose_identity"
+    violations=1
+fi
+
 if (( violations )); then
     exit 1
 fi
