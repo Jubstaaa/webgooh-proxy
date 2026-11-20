@@ -10,6 +10,13 @@
 # then either recreate the container (compose changed) or reload, sync the static
 # helpers, and smoke every hostname against smoke/baseline.txt. A failure after the
 # switch restores the previous release (config, compose, helpers) and exits 1.
+#
+# `deploy-proxy apply-env` is the second entry point, for root on the host only:
+# the infisical-agent hook runs it after rendering proxy.env. Caddy reads env only
+# at container creation, so a changed proxy.env is validated against the current
+# release in a throwaway container, then applied by a recreate and smoked; any
+# failure puts the last applied proxy.env back. The deploy key cannot reach it:
+# sshd runs the forced command with no arguments and sets SSH_ORIGINAL_COMMAND.
 set -Eeuo pipefail
 umask 077
 
@@ -26,6 +33,9 @@ ALLOWED_FILE='^(Caddyfile|docker-compose\.yml|smoke/baseline\.txt|sites/(beszel-
 ALLOWED_DIR='^(smoke|sites|sites/(beszel-shell|cronicle-identity))$'
 HELPERS=(beszel-shell cronicle-identity)
 SMOKE_DELAY=${DEPLOY_PROXY_SMOKE_DELAY:-2}
+ENV_FILE=$PROXY/proxy.env
+ENV_STATE=${DEPLOY_PROXY_ENV_STATE:-/var/lib/infisical-agent}
+ENV_WAIT=${DEPLOY_PROXY_ENV_WAIT:-600}
 
 sha=""
 prev=""
@@ -241,6 +251,70 @@ main() {
     log "DEPLOYED $sha (previous $prev)"
 }
 
+compose_cmd() {
+    "$DOCKER" compose --project-directory "$PROXY" -f "$PROXY/docker-compose.yml" "$@" >&2
+}
+
+env_sum() { sha256sum "$1" | cut -d' ' -f1; }
+
+# The applied copy is what the running container was created with; it is the
+# rollback target, because the agent has already overwritten proxy.env.
+restore_env() { install -m 0600 "$ENV_STATE/proxy.env.applied" "$ENV_FILE"; }
+
+reject_env() { # <sum> <reason>
+    restore_env
+    printf '%s\n' "$1" >"$ENV_STATE/proxy.rejected"
+    die "apply-env: $2; previous proxy.env restored, fix the values in Infisical"
+}
+
+apply_env() {
+    local sum keys
+    exec 9>"$LOCK"
+    flock -w "$ENV_WAIT" 9 || die "apply-env: $LOCK still held after ${ENV_WAIT}s"
+
+    [[ -f $ENV_FILE ]] || die "apply-env: $ENV_FILE missing"
+    chmod 600 "$ENV_FILE"
+    [[ -f $ENV_STATE/proxy.env.applied && -f $ENV_STATE/proxy.sha ]] ||
+        die "apply-env: no applied baseline in $ENV_STATE (seed proxy.env.applied and proxy.sha from the running container)"
+
+    sum=$(env_sum "$ENV_FILE")
+    [[ $sum == "$(cat "$ENV_STATE/proxy.sha")" ]] && return 0
+    if [[ -f $ENV_STATE/proxy.rejected && $sum == "$(cat "$ENV_STATE/proxy.rejected")" ]]; then
+        restore_env
+        die "apply-env: $sum was already rejected; previous proxy.env restored"
+    fi
+    # An empty render is a failed fetch, not an intended change.
+    keys=$(grep -cE '^[A-Za-z_][A-Za-z0-9_]*=' "$ENV_FILE" || true)
+    (( keys >= 1 )) || reject_env "$sum" "render has no keys"
+
+    log "apply-env: proxy.env changed ($sum, $keys keys)"
+    compose_cmd run --rm --no-deps -T --entrypoint caddy caddy \
+        validate --config /etc/caddy/current/Caddyfile --adapter caddyfile ||
+        reject_env "$sum" "caddy validate rejected $sum with release $(basename "$(readlink "$CONFIG/current")") (nothing restarted)"
+
+    if compose_cmd up -d --force-recreate --wait caddy && smoke "$CONFIG/current"; then
+        install -m 0600 "$ENV_FILE" "$ENV_STATE/proxy.env.applied"
+        printf '%s\n' "$sum" >"$ENV_STATE/proxy.sha"
+        rm -f -- "$ENV_STATE/proxy.rejected"
+        log "apply-env: APPLIED $sum"
+        return 0
+    fi
+
+    log "apply-env: ROLLBACK $sum"
+    restore_env
+    printf '%s\n' "$sum" >"$ENV_STATE/proxy.rejected"
+    if compose_cmd up -d --force-recreate --wait caddy && smoke "$CONFIG/current"; then
+        log "apply-env: previous proxy.env back; smoke clean"
+    else
+        log "apply-env: previous proxy.env back but smoke still fails: investigate now"
+    fi
+    exit 1
+}
+
 trap 'on_error $LINENO' ERR
 trap cleanup EXIT
-main "$@"
+if [[ ${1:-} == apply-env && -z ${SSH_ORIGINAL_COMMAND+set} ]]; then
+    apply_env
+else
+    main "$@"
+fi
