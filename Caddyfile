@@ -526,18 +526,3 @@ cron.webgooh.tech {
 		header_up Cookie "cf_email={http.request.header.Cf-Access-Authenticated-User-Email}"
 	}
 }
-
-# ── Cronicle identity endpoint — answers "who is this request", nothing else ──
-# Cronicle's external_user_api points here. It replies with a username and the
-# privileges that user should have, and Cronicle creates the account if it has
-# never seen it, which is what makes adding someone to the Access policy the only
-# step needed. Named accounts keep their existing usernames and admin rights;
-# everyone else arrives as their own email address with every privilege at zero,
-# so a new person can watch the schedule but not touch it.
-#
-# NOTE: Cronicle rewrites a user's privileges from this response on every login,
-# so removing someone from the named list demotes them on their next visit.
-#
-# Bound to the docker bridge address because Cronicle runs in a container and
-# reaches the host as host.docker.internal. Nothing off this machine can route to
-# 172.17.0.1, and the reply is worthless without a cookie the cron vhost writes.
