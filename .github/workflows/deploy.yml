@@ -51,7 +51,7 @@ jobs:
                       Caddyfile docker-compose.yml smoke/baseline.txt sites/beszel-shell sites/cronicle-identity
 
             - name: Pin the droplet host key
-              uses: Jubstaaa/deploy-actions/ssh@1d9b582d7547aa6f02352b655c0721dd5a88071f # v1.3.0
+              uses: Jubstaaa/deploy-actions/ssh@7784e6720e84053ef74ffed590e599bd92cf253c # v1.6.0
               with:
                   host: ${{ secrets.PROXY_DEPLOY_HOST }}
                   user: root
