@@ -177,3 +177,7 @@ installed by hand as root when the script itself changes (deliberately not by th
 deploy: a release that could replace its own forced command would turn the deploy
 key into root on the host). Install it from `main` after the PR merges. Check with
 `cmp /usr/local/bin/deploy-proxy scripts/deploy-proxy.sh` from a checkout.
+
+## License
+
+MIT

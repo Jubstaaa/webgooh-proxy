@@ -61,6 +61,5 @@ jobs:
 
             - name: Deploy through the forced command
               run: |
-                  # The commit is a 40-hex SHA from git rev-parse, so expanding it on the runner is safe.
                   # shellcheck disable=SC2029
                   ssh droplet "deploy-proxy $DEPLOY_SHA" <"$RUNNER_TEMP/release.tar"
